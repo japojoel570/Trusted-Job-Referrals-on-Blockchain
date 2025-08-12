@@ -3,6 +3,7 @@
 (define-constant ERR-INVALID-INPUT (err u101))
 (define-constant ERR-DUPLICATE-ENTRY (err u102))
 (define-constant ERR-NOT-FOUND (err u103))
+(define-constant ERR-EXPIRED (err u104))
 
 (define-map referrals 
     { candidate: principal, referrer: principal } 
@@ -226,6 +227,13 @@
     { successful-referral: u100, verification-bonus: u50, tip-multiplier: u2 }
 )
 
+(define-data-var referral-expiry-period uint u144)
+
+(define-map expired-referrals
+    { candidate: principal, referrer: principal }
+    { expired-at: uint }
+)
+
 (define-public (claim-referral-reward (candidate principal) (referrer principal))
     (let ((referral-data (unwrap! (get-referral candidate referrer) ERR-NOT-FOUND))
           (rating-data (unwrap! (get-referral-rating candidate referrer) ERR-NOT-FOUND)))
@@ -327,4 +335,79 @@
 
 (define-read-only (get-token-balance (user principal))
     (ft-get-balance referral-points user)
+)
+
+(define-public (expire-referral (candidate principal) (referrer principal))
+    (let ((referral-key { candidate: candidate, referrer: referrer }))
+        (let ((referral-data (unwrap! (map-get? referrals referral-key) ERR-NOT-FOUND)))
+            (asserts! (>= (- stacks-block-height (get timestamp referral-data)) (var-get referral-expiry-period)) ERR-INVALID-INPUT)
+            (asserts! (is-none (map-get? expired-referrals referral-key)) ERR-DUPLICATE-ENTRY)
+            
+            (map-set expired-referrals
+                referral-key
+                { expired-at: stacks-block-height }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (renew-referral 
+    (candidate principal)
+    (role (string-ascii 50))
+    (company (string-ascii 50))
+    (relationship (string-ascii 50))
+    (performance-notes (string-ascii 200))
+    (start-date uint)
+    (end-date uint))
+    
+    (let ((referral-key { candidate: candidate, referrer: tx-sender }))
+        (asserts! (is-some (map-get? expired-referrals referral-key)) ERR-NOT-FOUND)
+        (asserts! (not (is-eq tx-sender candidate)) ERR-INVALID-INPUT)
+        
+        (map-delete expired-referrals referral-key)
+        (map-set referrals
+            referral-key
+            {
+                role: role,
+                company: company,
+                relationship: relationship,
+                performance-notes: performance-notes,
+                start-date: start-date,
+                end-date: end-date,
+                timestamp: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (set-expiry-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-period u0) ERR-INVALID-INPUT)
+        (var-set referral-expiry-period new-period)
+        (ok true)
+    )
+)
+
+(define-read-only (is-referral-expired (candidate principal) (referrer principal))
+    (is-some (map-get? expired-referrals { candidate: candidate, referrer: referrer }))
+)
+
+(define-read-only (check-referral-expiry (candidate principal) (referrer principal))
+    (let ((referral-data (map-get? referrals { candidate: candidate, referrer: referrer })))
+        (match referral-data
+            data (>= (- stacks-block-height (get timestamp data)) (var-get referral-expiry-period))
+            false
+        )
+    )
+)
+
+(define-read-only (get-expiry-period)
+    (var-get referral-expiry-period)
+)
+
+(define-read-only (get-expired-referral (candidate principal) (referrer principal))
+    (map-get? expired-referrals { candidate: candidate, referrer: referrer })
 )
