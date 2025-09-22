@@ -4,6 +4,8 @@
 (define-constant ERR-DUPLICATE-ENTRY (err u102))
 (define-constant ERR-NOT-FOUND (err u103))
 (define-constant ERR-EXPIRED (err u104))
+(define-constant ERR-NOT-EMPLOYER (err u105))
+(define-constant ERR-ALREADY-VERIFIED (err u106))
 
 (define-map referrals 
     { candidate: principal, referrer: principal } 
@@ -234,12 +236,76 @@
     { expired-at: uint }
 )
 
+(define-map verified-employers
+    { employer: principal }
+    {
+        company-name: (string-ascii 50),
+        verified-at: uint,
+        verified-by: principal
+    }
+)
+
+(define-map job-verifications
+    { candidate: principal, referrer: principal }
+    {
+        employer: principal,
+        job-title: (string-ascii 50),
+        hire-date: uint,
+        verified-at: uint,
+        verified: bool
+    }
+)
+
+(define-public (register-employer (employer principal) (company-name (string-ascii 50)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (map-get? verified-employers { employer: employer })) ERR-DUPLICATE-ENTRY)
+        
+        (map-set verified-employers
+            { employer: employer }
+            {
+                company-name: company-name,
+                verified-at: stacks-block-height,
+                verified-by: tx-sender
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (verify-job-placement 
+    (candidate principal)
+    (referrer principal)
+    (job-title (string-ascii 50))
+    (hire-date uint))
+    
+    (let ((verification-key { candidate: candidate, referrer: referrer }))
+        (asserts! (is-some (map-get? verified-employers { employer: tx-sender })) ERR-NOT-EMPLOYER)
+        (asserts! (is-some (map-get? referrals { candidate: candidate, referrer: referrer })) ERR-NOT-FOUND)
+        (asserts! (is-none (map-get? job-verifications verification-key)) ERR-ALREADY-VERIFIED)
+        
+        (map-set job-verifications
+            verification-key
+            {
+                employer: tx-sender,
+                job-title: job-title,
+                hire-date: hire-date,
+                verified-at: stacks-block-height,
+                verified: true
+            }
+        )
+        (ok true)
+    )
+)
+
 (define-public (claim-referral-reward (candidate principal) (referrer principal))
     (let ((referral-data (unwrap! (get-referral candidate referrer) ERR-NOT-FOUND))
-          (rating-data (unwrap! (get-referral-rating candidate referrer) ERR-NOT-FOUND)))
+          (rating-data (unwrap! (get-referral-rating candidate referrer) ERR-NOT-FOUND))
+          (verification-data (unwrap! (get-job-verification candidate referrer) ERR-NOT-FOUND)))
         
         (asserts! (is-eq tx-sender referrer) ERR-NOT-AUTHORIZED)
         (asserts! (>= (get rating rating-data) u4) ERR-INVALID-INPUT)
+        (asserts! (get verified verification-data) ERR-NOT-FOUND)
         
         (let ((reward-amount (calculate-reward-amount referrer (get rating rating-data)))
               (claim-counter (get counter (default-to { counter: u0 } 
@@ -410,4 +476,23 @@
 
 (define-read-only (get-expired-referral (candidate principal) (referrer principal))
     (map-get? expired-referrals { candidate: candidate, referrer: referrer })
+)
+
+(define-read-only (is-verified-employer (employer principal))
+    (is-some (map-get? verified-employers { employer: employer }))
+)
+
+(define-read-only (get-employer-info (employer principal))
+    (map-get? verified-employers { employer: employer })
+)
+
+(define-read-only (get-job-verification (candidate principal) (referrer principal))
+    (map-get? job-verifications { candidate: candidate, referrer: referrer })
+)
+
+(define-read-only (is-job-verified (candidate principal) (referrer principal))
+    (match (map-get? job-verifications { candidate: candidate, referrer: referrer })
+        verification (get verified verification)
+        false
+    )
 )
