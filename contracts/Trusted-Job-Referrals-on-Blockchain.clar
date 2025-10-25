@@ -496,3 +496,98 @@
         false
     )
 )
+
+(define-map referral-endorsements
+    { candidate: principal, referrer: principal, endorser: principal }
+    {
+        endorsement-text: (string-ascii 200),
+        credibility-score: uint,
+        timestamp: uint
+    }
+)
+
+(define-map endorsement-counts
+    { candidate: principal, referrer: principal }
+    { count: uint, total-credibility: uint }
+)
+
+(define-public (endorse-referral
+    (candidate principal)
+    (referrer principal)
+    (endorsement-text (string-ascii 200))
+    (credibility-score uint))
+    
+    (let ((endorsement-key { candidate: candidate, referrer: referrer, endorser: tx-sender }))
+        (asserts! (is-some (map-get? referrals { candidate: candidate, referrer: referrer })) ERR-NOT-FOUND)
+        (asserts! (not (is-eq tx-sender candidate)) ERR-INVALID-INPUT)
+        (asserts! (not (is-eq tx-sender referrer)) ERR-INVALID-INPUT)
+        (asserts! (and (>= credibility-score u1) (<= credibility-score u10)) ERR-INVALID-INPUT)
+        (asserts! (is-none (map-get? referral-endorsements endorsement-key)) ERR-DUPLICATE-ENTRY)
+        (asserts! (is-some (map-get? user-profiles { user: tx-sender })) ERR-NOT-FOUND)
+        
+        (map-set referral-endorsements
+            endorsement-key
+            {
+                endorsement-text: endorsement-text,
+                credibility-score: credibility-score,
+                timestamp: stacks-block-height
+            }
+        )
+        
+        (increment-endorsement-count candidate referrer credibility-score)
+        (ok true)
+    )
+)
+
+(define-private (increment-endorsement-count (candidate principal) (referrer principal) (score uint))
+    (let ((count-key { candidate: candidate, referrer: referrer })
+          (current-data (default-to { count: u0, total-credibility: u0 } 
+                (map-get? endorsement-counts count-key))))
+        (map-set endorsement-counts
+            count-key
+            {
+                count: (+ (get count current-data) u1),
+                total-credibility: (+ (get total-credibility current-data) score)
+            }
+        )
+    )
+)
+
+(define-public (revoke-endorsement (candidate principal) (referrer principal))
+    (let ((endorsement-key { candidate: candidate, referrer: referrer, endorser: tx-sender })
+          (endorsement-data (unwrap! (map-get? referral-endorsements endorsement-key) ERR-NOT-FOUND)))
+        
+        (let ((count-key { candidate: candidate, referrer: referrer })
+              (current-data (unwrap! (map-get? endorsement-counts count-key) ERR-NOT-FOUND)))
+            
+            (map-delete referral-endorsements endorsement-key)
+            (map-set endorsement-counts
+                count-key
+                {
+                    count: (- (get count current-data) u1),
+                    total-credibility: (- (get total-credibility current-data) (get credibility-score endorsement-data))
+                }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-endorsement (candidate principal) (referrer principal) (endorser principal))
+    (map-get? referral-endorsements { candidate: candidate, referrer: referrer, endorser: endorser })
+)
+
+(define-read-only (get-endorsement-counts (candidate principal) (referrer principal))
+    (default-to { count: u0, total-credibility: u0 }
+        (map-get? endorsement-counts { candidate: candidate, referrer: referrer })
+    )
+)
+
+(define-read-only (calculate-endorsement-average (candidate principal) (referrer principal))
+    (let ((endorsement-data (get-endorsement-counts candidate referrer)))
+        (if (is-eq (get count endorsement-data) u0)
+            u0
+            (/ (get total-credibility endorsement-data) (get count endorsement-data))
+        )
+    )
+)
