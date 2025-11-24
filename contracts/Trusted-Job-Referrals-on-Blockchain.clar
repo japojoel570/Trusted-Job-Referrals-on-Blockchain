@@ -6,6 +6,11 @@
 (define-constant ERR-EXPIRED (err u104))
 (define-constant ERR-NOT-EMPLOYER (err u105))
 (define-constant ERR-ALREADY-VERIFIED (err u106))
+(define-constant ERR-DISPUTE-EXISTS (err u107))
+(define-constant ERR-DISPUTE-NOT-FOUND (err u108))
+(define-constant ERR-DISPUTE-CLOSED (err u109))
+(define-constant ERR-ALREADY-VOTED (err u110))
+(define-constant ERR-INSUFFICIENT-VOTES (err u111))
 
 (define-map referrals 
     { candidate: principal, referrer: principal } 
@@ -589,5 +594,224 @@
             u0
             (/ (get total-credibility endorsement-data) (get count endorsement-data))
         )
+    )
+)
+
+(define-map referral-disputes
+    { candidate: principal, referrer: principal }
+    {
+        dispute-reason: (string-ascii 300),
+        raised-by: principal,
+        raised-at: uint,
+        status: (string-ascii 20),
+        votes-for: uint,
+        votes-against: uint,
+        resolution: (string-ascii 300),
+        resolved-at: uint,
+        penalty-applied: bool
+    }
+)
+
+(define-map dispute-votes
+    { candidate: principal, referrer: principal, voter: principal }
+    {
+        vote: bool,
+        weight: uint,
+        timestamp: uint
+    }
+)
+
+(define-data-var dispute-vote-threshold uint u3)
+
+(define-data-var penalty-percentage uint u20)
+
+(define-public (raise-dispute
+    (candidate principal)
+    (referrer principal)
+    (dispute-reason (string-ascii 300)))
+    
+    (let ((dispute-key { candidate: candidate, referrer: referrer }))
+        (asserts! (is-some (map-get? referrals dispute-key)) ERR-NOT-FOUND)
+        (asserts! (is-none (map-get? referral-disputes dispute-key)) ERR-DISPUTE-EXISTS)
+        (asserts! (or (is-eq tx-sender candidate) (is-eq tx-sender referrer)) ERR-NOT-AUTHORIZED)
+        
+        (map-set referral-disputes
+            dispute-key
+            {
+                dispute-reason: dispute-reason,
+                raised-by: tx-sender,
+                raised-at: stacks-block-height,
+                status: "open",
+                votes-for: u0,
+                votes-against: u0,
+                resolution: "",
+                resolved-at: u0,
+                penalty-applied: false
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (vote-on-dispute
+    (candidate principal)
+    (referrer principal)
+    (vote-for bool))
+    
+    (let ((dispute-key { candidate: candidate, referrer: referrer })
+          (vote-key { candidate: candidate, referrer: referrer, voter: tx-sender })
+          (dispute-data (unwrap! (map-get? referral-disputes dispute-key) ERR-DISPUTE-NOT-FOUND))
+          (voter-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR-NOT-FOUND)))
+        
+        (asserts! (is-eq (get status dispute-data) "open") ERR-DISPUTE-CLOSED)
+        (asserts! (is-none (map-get? dispute-votes vote-key)) ERR-ALREADY-VOTED)
+        (asserts! (not (is-eq tx-sender candidate)) ERR-INVALID-INPUT)
+        (asserts! (not (is-eq tx-sender referrer)) ERR-INVALID-INPUT)
+        (asserts! (not (is-eq tx-sender (get raised-by dispute-data))) ERR-INVALID-INPUT)
+        
+        (let ((vote-weight (if (get verified voter-profile) u2 u1)))
+            (map-set dispute-votes
+                vote-key
+                {
+                    vote: vote-for,
+                    weight: vote-weight,
+                    timestamp: stacks-block-height
+                }
+            )
+            
+            (let ((new-votes-for (if vote-for (+ (get votes-for dispute-data) vote-weight) (get votes-for dispute-data)))
+                  (new-votes-against (if vote-for (get votes-against dispute-data) (+ (get votes-against dispute-data) vote-weight))))
+                
+                (map-set referral-disputes
+                    dispute-key
+                    (merge dispute-data {
+                        votes-for: new-votes-for,
+                        votes-against: new-votes-against
+                    })
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (resolve-dispute
+    (candidate principal)
+    (referrer principal)
+    (resolution-text (string-ascii 300)))
+    
+    (let ((dispute-key { candidate: candidate, referrer: referrer })
+          (dispute-data (unwrap! (map-get? referral-disputes dispute-key) ERR-DISPUTE-NOT-FOUND)))
+        
+        (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status dispute-data) "open") ERR-DISPUTE-CLOSED)
+        (asserts! (>= (+ (get votes-for dispute-data) (get votes-against dispute-data)) (var-get dispute-vote-threshold)) ERR-INSUFFICIENT-VOTES)
+        
+        (let ((dispute-upheld (> (get votes-for dispute-data) (get votes-against dispute-data))))
+            (map-set referral-disputes
+                dispute-key
+                (merge dispute-data {
+                    status: "resolved",
+                    resolution: resolution-text,
+                    resolved-at: stacks-block-height,
+                    penalty-applied: dispute-upheld
+                })
+            )
+            
+            (if dispute-upheld
+                (begin
+                    (apply-dispute-penalty referrer)
+                    (ok true)
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (apply-dispute-penalty (user principal))
+    (let ((current-balance (get balance (default-to { balance: u0 } 
+            (map-get? reward-balances { user: user }))))
+          (penalty-amount (/ (* current-balance (var-get penalty-percentage)) u100)))
+        
+        (map-set reward-balances
+            { user: user }
+            { balance: (- current-balance penalty-amount) }
+        )
+        
+        (let ((current-rep (default-to 
+                { score: u0, total-referrals: u0, successful-referrals: u0, last-updated: u0 }
+                (map-get? reputation-scores { user: user }))))
+            (map-set reputation-scores
+                { user: user }
+                (merge current-rep {
+                    score: (if (>= (get score current-rep) u100) (- (get score current-rep) u100) u0)
+                })
+            )
+        )
+    )
+)
+
+(define-public (dismiss-dispute
+    (candidate principal)
+    (referrer principal)
+    (dismissal-reason (string-ascii 300)))
+    
+    (let ((dispute-key { candidate: candidate, referrer: referrer })
+          (dispute-data (unwrap! (map-get? referral-disputes dispute-key) ERR-DISPUTE-NOT-FOUND)))
+        
+        (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status dispute-data) "open") ERR-DISPUTE-CLOSED)
+        
+        (map-set referral-disputes
+            dispute-key
+            (merge dispute-data {
+                status: "dismissed",
+                resolution: dismissal-reason,
+                resolved-at: stacks-block-height
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (set-dispute-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-threshold u0) ERR-INVALID-INPUT)
+        (var-set dispute-vote-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-public (set-penalty-percentage (new-percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (and (> new-percentage u0) (<= new-percentage u100)) ERR-INVALID-INPUT)
+        (var-set penalty-percentage new-percentage)
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (candidate principal) (referrer principal))
+    (map-get? referral-disputes { candidate: candidate, referrer: referrer })
+)
+
+(define-read-only (get-dispute-vote (candidate principal) (referrer principal) (voter principal))
+    (map-get? dispute-votes { candidate: candidate, referrer: referrer, voter: voter })
+)
+
+(define-read-only (get-dispute-threshold)
+    (var-get dispute-vote-threshold)
+)
+
+(define-read-only (get-penalty-percentage)
+    (var-get penalty-percentage)
+)
+
+(define-read-only (is-dispute-active (candidate principal) (referrer principal))
+    (match (map-get? referral-disputes { candidate: candidate, referrer: referrer })
+        dispute (is-eq (get status dispute) "open")
+        false
     )
 )
